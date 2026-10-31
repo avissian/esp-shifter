@@ -1,0 +1,75 @@
+name: Firmware release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^#define FW_VERSION "\([^"]*\)"/\1/p' main.cpp)
+          test -n "$version"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match firmware v$version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Host regression tests
+        run: bash scripts/test.sh
+      - uses: arduino/setup-arduino-cli@81d310742121c928ea9c8bbd407b4217b432ae02 # v2.0.0
+        with:
+          version: '1.5.1'
+      - name: Install ESP8266 core
+        run: |
+          arduino-cli core update-index --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core install esp8266:esp8266@3.1.2 --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+      - name: Build NodeMCU firmware
+        run: bash scripts/build-release.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: esp-shifter-v${{ steps.version.outputs.version }}
+          path: build/release/v${{ steps.version.outputs.version }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: esp-shifter-v${{ needs.build.outputs.version }}
+          path: release
+      - name: Verify checksums and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        working-directory: release
+        run: |
+          sha256sum --check SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag --title "ESP-Shifter $GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            ./*.bin SHA256SUMS BUILD_INFO.txt RELEASE_NOTES.md

@@ -2,7 +2,7 @@
 // Board: NodeMCU Amica (ESP8266EX, CP2102)
 // Protocol: https://github.com/OpenBikeControl/openbikecontrol-protocol (mDNS + TCP)
 //
-// v1.0.0
+// v1.0.1
 //
 // Pins:
 //   D1 (GPIO5)  — Shift Up button (to GND)
@@ -11,7 +11,7 @@
 //
 // First boot / no credentials / WiFi unreachable:
 //   AP "ESP-Shifter-Setup" (password in README), captive portal on
-//   http://esp-shifter.local or http://192.168.4.1 — empty fields, save, reboot.
+//   http://192.168.4.1 — empty credential fields, save, reboot.
 //   Credentials live in EEPROM on the board, never in the binary.
 //
 // v2 (planned): 8x8 LED matrix on D5/D6/D7 (74HC595 x2 or MAX7219)
@@ -25,8 +25,10 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
+#include "ObcProtocol.h"
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
+#define OTA_USER "admin"
 
 // ---------- OpenBikeControl ----------
 #define OBC_PORT         8080
@@ -35,11 +37,6 @@
 #define OBC_MANUFACTURER "avissian"
 #define OBC_MODEL        "ESP-Shifter v1"
 #define OBC_SERVICE_UUID "d273f680-d548-419d-b9d1-fa0472345229"
-
-#define MSG_BUTTON       0x01
-#define MSG_STATUS       0x02
-#define MSG_HAPTIC       0x03
-#define MSG_APP_INFO     0x04
 
 #define BTN_SHIFT_UP     0x01
 #define BTN_SHIFT_DOWN   0x02
@@ -71,6 +68,7 @@ struct Config {
 // ---------- Globals ----------
 WiFiServer obcServer(OBC_PORT);
 WiFiClient obcClient;
+obc::Parser obcParser;
 ESP8266WebServer httpServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
 DNSServer dnsServer;
@@ -81,6 +79,12 @@ bool setupMode = false;
 
 unsigned long lastStatusMs = 0;
 unsigned long setupHoldStart = 0;
+bool setupHoldActive = false;
+bool ledFlashing = false;
+unsigned long ledFlashStart = 0;
+bool wifiRecovering = false;
+unsigned long wifiRecoveryStart = 0;
+char setupToken[33];
 
 struct Button {
   uint8_t pin;
@@ -96,16 +100,19 @@ Button btnDown = { PIN_DOWN, BTN_SHIFT_DOWN, false, false, 0 };
 void sendButtonState(uint8_t obcId, bool pressed);
 void sendStatus();
 void flashLed();
+void updateLed();
 void handleButton(struct Button& b);
 void handleObcClient();
 bool loadConfig();
-void saveConfig(const String& ssid, const String& pass, const String& otaPass);
+bool saveConfig(const String& ssid, const String& pass, const String& otaPass);
 void clearConfig();
 void startSetupMode();
 void handleRoot();
 void handleSave();
 void serveSetupForm();
-void runShifterLoop();
+void setupHttpRoutes();
+bool authorizeSetup();
+bool checkWiFi();
 
 // ---------- Config storage ----------
 uint32_t cfgChecksum(const Config& c) {
@@ -129,15 +136,18 @@ bool loadConfig() {
   return strlen(cfg.ssid) > 0;
 }
 
-void saveConfig(const String& ssid, const String& pass, const String& otaPass) {
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.magic = CFG_MAGIC;
-  strncpy(cfg.ssid, ssid.c_str(), sizeof(cfg.ssid)-1);
-  strncpy(cfg.pass, pass.c_str(), sizeof(cfg.pass)-1);
-  strncpy(cfg.otaPass, otaPass.c_str(), sizeof(cfg.otaPass)-1);
-  cfg.crc = cfgChecksum(cfg);
-  EEPROM.put(0, cfg);
-  EEPROM.commit();
+bool saveConfig(const String& ssid, const String& pass, const String& otaPass) {
+  Config next;
+  memset(&next, 0, sizeof(next));
+  next.magic = CFG_MAGIC;
+  strncpy(next.ssid, ssid.c_str(), sizeof(next.ssid)-1);
+  strncpy(next.pass, pass.c_str(), sizeof(next.pass)-1);
+  strncpy(next.otaPass, otaPass.c_str(), sizeof(next.otaPass)-1);
+  next.crc = cfgChecksum(next);
+  EEPROM.put(0, next);
+  if (!EEPROM.commit()) return false;
+  cfg = next;
+  return true;
 }
 
 void clearConfig() {
@@ -148,14 +158,23 @@ void clearConfig() {
 
 // ---------- LED / buttons ----------
 void flashLed() {
+  ledFlashStart = millis();
+  ledFlashing = true;
   digitalWrite(LED_BUILTIN, LOW);
-  delay(10);
-  digitalWrite(LED_BUILTIN, HIGH);
+}
+
+void updateLed() {
+  if (setupMode) {
+    digitalWrite(LED_BUILTIN, (millis() / 500UL) % 2 ? HIGH : LOW);
+    return;
+  }
+  if (ledFlashing && millis() - ledFlashStart >= 10) ledFlashing = false;
+  digitalWrite(LED_BUILTIN, ledFlashing ? LOW : HIGH);
 }
 
 void sendButtonState(uint8_t obcId, bool pressed) {
   if (!obcClient.connected()) return;
-  uint8_t msg[3] = { MSG_BUTTON, obcId, (uint8_t)(pressed ? 0x01 : 0x00) };
+  uint8_t msg[3] = { obc::ButtonState, obcId, (uint8_t)(pressed ? 0x01 : 0x00) };
   obcClient.write(msg, 3);
   Serial.printf("[OBC] %s %s\n", obcId == BTN_SHIFT_UP ? "UP" : "DOWN", pressed ? "press" : "release");
   flashLed();
@@ -163,7 +182,7 @@ void sendButtonState(uint8_t obcId, bool pressed) {
 
 void sendStatus() {
   if (!obcClient.connected()) return;
-  uint8_t msg[3] = { MSG_STATUS, 0xFF, 0x01 };
+  uint8_t msg[3] = { obc::DeviceStatus, 0xFF, 0x01 };
   obcClient.write(msg, 3);
 }
 
@@ -184,27 +203,29 @@ void handleButton(struct Button& b) {
 
 // ---------- OBC client traffic ----------
 void handleObcClient() {
-  while (obcClient.available()) {
-    uint8_t type = obcClient.read();
-    if (type == MSG_APP_INFO) {
-      String appId = "", appVer = "";
-      if (obcClient.available()) obcClient.read(); // format version
-      if (obcClient.available()) {
-        int idLen = obcClient.read();
-        for (int i = 0; i < idLen && obcClient.available(); i++) appId += (char)obcClient.read();
+  // Bound work per loop so an active TCP peer cannot starve button polling.
+  for (size_t count = 0; count < 64 && obcClient.available(); count++) {
+    int byte = obcClient.read();
+    if (byte < 0) break;
+    obc::ParseResult result = obcParser.feed(static_cast<uint8_t>(byte));
+    if (result == obc::ParseResult::Invalid) {
+      Serial.println("[OBC] invalid command, disconnecting client");
+      obcClient.stop();
+      obcParser.reset();
+      return;
+    }
+    if (result != obc::ParseResult::Complete) continue;
+    const obc::Message& msg = obcParser.message();
+    if (msg.type == obc::AppInfo) {
+      Serial.printf("[OBC] App connected: %s %s (%u actions)\n",
+                    msg.appId, msg.appVersion, msg.buttonCount);
+    } else if (msg.type == obc::Haptic) {
+      // This board has no vibration motor: acknowledge with a nonblocking LED.
+      if (msg.pattern == 0) {
+        ledFlashing = false;
+      } else {
+        flashLed();
       }
-      if (obcClient.available()) {
-        int vLen = obcClient.read();
-        for (int i = 0; i < vLen && obcClient.available(); i++) appVer += (char)obcClient.read();
-      }
-      Serial.printf("[OBC] App connected: %s %s\n", appId.c_str(), appVer.c_str());
-    } else if (type == MSG_HAPTIC) {
-      uint8_t rest[3] = {0,0,0};
-      for (int i = 0; i < 3 && obcClient.available(); i++) rest[i] = obcClient.read();
-      Serial.printf("[OBC] Haptic: pattern=0x%02X duration=0x%02X intensity=0x%02X\n", rest[0], rest[1], rest[2]);
-      for (int i = 0; i < 3; i++) { flashLed(); delay(60); }
-    } else {
-      Serial.printf("[OBC] Unknown message type 0x%02X\n", type);
     }
   }
 }
@@ -222,8 +243,9 @@ small{color:#888}</style></head><body>
 void serveSetupForm() {
   String html = FPSTR(SETUP_FORM);
   html += FW_VERSION;
-  html += F("</h1><form method='POST' action='/save'>"
-            "WiFi SSID<input name='ssid' maxlength='32' required>"
+  html += F("</h1><form method='POST' action='/save'><input type='hidden' name='token' value='");
+  html += setupToken;
+  html += F("'>WiFi SSID<input name='ssid' maxlength='32' required>"
             "WiFi password<input name='pass' type='password' maxlength='64'>"
             "OTA password<input name='ota' type='password' maxlength='32'>"
             "<small>Empty OTA password disables network flashing.</small>"
@@ -234,36 +256,111 @@ void serveSetupForm() {
 
 void startSetupMode() {
   setupMode = true;
+  setupHoldActive = false;
+  obcClient.stop();
+  obcParser.reset();
   Serial.println("[SETUP] starting AP " AP_SSID);
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   dnsServer.start(53, "*", WiFi.softAPIP());
 
-  httpServer.on("/", serveSetupForm);
-  httpServer.on("/generate_204", serveSetupForm);   // Android captive check
-  httpServer.on("/fwlink", serveSetupForm);
-  httpServer.onNotFound([]() {
-    httpServer.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
-    httpServer.send(302, "text/plain", "");
-  });
-  httpServer.on("/save", []() {
-    String ssid = httpServer.arg("ssid");
-    String pass = httpServer.arg("pass");
-    String ota  = httpServer.arg("ota");
-    if (ssid.length() == 0) {
-      httpServer.send(400, "text/plain", "SSID required\n");
-      return;
-    }
-    saveConfig(ssid, pass, ota);
-    Serial.printf("[SETUP] saved SSID '%s', rebooting\n", ssid.c_str());
-    httpServer.send(200, "text/html", "<html><body><h2>Saved. Rebooting...</h2></body></html>");
-    delay(500);
-    ESP.restart();
-  });
+  // Routes are registered once; switching modes must not shadow the root form.
   httpServer.begin();
   Serial.printf("[SETUP] portal: http://%s\n", WiFi.softAPIP().toString().c_str());
-  // slow blink: setup mode
-  for (int i = 0; i < 6; i++) { flashLed(); delay(250); }
+}
+
+bool authorizeSetup() {
+  if (setupMode) return true;
+  if (cfg.otaPass[0] == '\0') {
+    httpServer.send(403, "text/plain",
+                    "Hold both buttons for 5 seconds and join " AP_SSID " to configure.\n");
+    return false;
+  }
+  if (!httpServer.authenticate(OTA_USER, cfg.otaPass)) {
+    httpServer.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
+void handleRoot() {
+  if (setupMode) {
+    serveSetupForm();
+    return;
+  }
+  char buf[192];
+  snprintf(buf, sizeof(buf),
+           "ESP-Shifter v%s\nIP: %s\nOBC clients: %d\nSetup: /setup\nUpdate: /update\n",
+           FW_VERSION, WiFi.localIP().toString().c_str(),
+           obcClient.connected() ? 1 : 0);
+  httpServer.send(200, "text/plain", buf);
+}
+
+void handleSave() {
+  if (!authorizeSetup()) return;
+  if (setupToken[0] == '\0' || httpServer.arg("token") != setupToken) {
+    httpServer.send(403, "text/plain", "Invalid form token. Reload the setup page.\n");
+    return;
+  }
+  String ssid = httpServer.arg("ssid");
+  String pass = httpServer.arg("pass");
+  String ota = httpServer.arg("ota");
+  if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64 || ota.length() > 32) {
+    httpServer.send(400, "text/plain", "Invalid SSID or password length.\n");
+    return;
+  }
+  if (!saveConfig(ssid, pass, ota)) {
+    httpServer.send(500, "text/plain", "Could not save configuration.\n");
+    return;
+  }
+  Serial.printf("[SETUP] saved SSID '%s', rebooting\n", ssid.c_str());
+  httpServer.send(200, "text/html", "<html><body><h2>Saved. Rebooting...</h2></body></html>");
+  delay(500);
+  ESP.restart();
+}
+
+void setupHttpRoutes() {
+  // Boot-scoped CSRF protection for authenticated LAN configuration changes.
+  snprintf(setupToken, sizeof(setupToken), "%08x%08x%08x%08x",
+           ESP.random(), ESP.random(), ESP.random(), ESP.random());
+  httpServer.on("/", HTTP_GET, handleRoot);
+  httpServer.on("/setup", HTTP_GET, []() {
+    if (authorizeSetup()) serveSetupForm();
+  });
+  httpServer.on("/save", HTTP_POST, handleSave);
+  httpServer.on("/generate_204", HTTP_GET, handleRoot);  // Android captive check
+  httpServer.on("/fwlink", HTTP_GET, handleRoot);
+  httpServer.onNotFound([]() {
+    if (setupMode) {
+      httpServer.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/");
+      httpServer.send(302, "text/plain", "");
+    } else {
+      httpServer.send(404, "text/plain", "Not found\n");
+    }
+  });
+}
+
+bool checkWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiRecovering) {
+      Serial.println("[WiFi] reconnected");
+      wifiRecovering = false;
+      MDNS.begin(OBC_NAME);  // Re-probe preserved services on the current IP.
+    }
+    return true;
+  }
+  if (!wifiRecovering) {
+    wifiRecovering = true;
+    wifiRecoveryStart = millis();
+    obcClient.stop();
+    obcParser.reset();
+    Serial.println("[WiFi] lost, reconnecting...");
+    WiFi.reconnect();  // Once: repeated disconnect/connect cancels association.
+  } else if (millis() - wifiRecoveryStart >= WIFI_TIMEOUT_MS) {
+    Serial.println("[WiFi] reconnect timed out, entering setup mode");
+    startSetupMode();
+  }
+  return false;
 }
 
 // ---------- Main setup ----------
@@ -277,6 +374,10 @@ void setup() {
   digitalWrite(LED_BUILTIN, HIGH);
 
   haveConfig = loadConfig();
+  WiFi.persistent(false);
+  // ESP8266's hardware RNG needs RF entropy before generating the form token.
+  WiFi.mode(WIFI_STA);
+  setupHttpRoutes();
 
   // Both buttons held at boot -> force setup mode
   if (digitalRead(PIN_UP) == LOW && digitalRead(PIN_DOWN) == LOW) {
@@ -292,7 +393,6 @@ void setup() {
 
   // Try to connect with stored credentials
   Serial.printf("[WiFi] connecting to '%s' ", cfg.ssid);
-  WiFi.mode(WIFI_STA);
   WiFi.hostname(OBC_NAME);
   WiFi.begin(cfg.ssid, cfg.pass);
   unsigned long t0 = millis();
@@ -327,18 +427,8 @@ void setup() {
 
   // Web OTA updater at http://esp-shifter.local/update
   if (strlen(cfg.otaPass) > 0) {
-    httpUpdater.setup(&httpServer, "/update", "", cfg.otaPass);
+    httpUpdater.setup(&httpServer, "/update", OTA_USER, cfg.otaPass);
   }
-  httpServer.on("/", []() {
-    char buf[192];
-    snprintf(buf, sizeof(buf),
-             "ESP-Shifter v%s\nIP: %s\nOBC clients: %d\nSetup: /setup\nUpdate: /update\n",
-             FW_VERSION, WiFi.localIP().toString().c_str(),
-             obcClient.connected() ? 1 : 0);
-    httpServer.send(200, "text/plain", buf);
-  });
-  // /setup in normal mode: same form (empty fields), save & reboot
-  httpServer.on("/setup", serveSetupForm);
   httpServer.begin();
 
   // Arduino OTA (network upload, port 8266)
@@ -352,24 +442,38 @@ void setup() {
 }
 
 void loop() {
+  updateLed();
+  handleButton(btnUp);
+  handleButton(btnDown);
+
+  // Physical recovery is available even when the station connection is down.
+  if (!setupMode) {
+    bool bothHeld = btnUp.stableState && btnDown.stableState;
+    if (bothHeld) {
+      if (!setupHoldActive) {
+        setupHoldActive = true;
+        setupHoldStart = millis();
+      }
+      if (millis() - setupHoldStart >= SETUP_HOLD_MS) {
+        Serial.println("[BTN] both held 5s -> setup mode");
+        startSetupMode();
+      }
+    } else {
+      setupHoldActive = false;
+    }
+  }
+
   if (setupMode) {
     dnsServer.processNextRequest();
     httpServer.handleClient();
-    handleButton(btnUp);    // keeps debounce honest, actions suppressed
-    handleButton(btnDown);
     return;
   }
+
+  if (!checkWiFi()) return;
 
   ArduinoOTA.handle();
   httpServer.handleClient();
   MDNS.update();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] lost, reconnecting...");
-    WiFi.reconnect();
-    delay(1000);
-    return;
-  }
 
   // Accept new OBC connections (keep only the latest client)
   if (obcServer.hasClient()) {
@@ -379,6 +483,8 @@ void loop() {
       obcClient.stop();
     }
     obcClient = newClient;
+    obcParser.reset();
+    lastStatusMs = millis();
     Serial.printf("[OBC] client connected from %s\n", obcClient.remoteIP().toString().c_str());
     sendStatus();
   }
@@ -389,22 +495,5 @@ void loop() {
       lastStatusMs = millis();
       sendStatus();
     }
-  }
-
-  handleButton(btnUp);
-  handleButton(btnDown);
-
-  // Both buttons held 5s -> setup mode (WiFi change without a computer)
-  bool bothHeld = (digitalRead(PIN_UP) == LOW && digitalRead(PIN_DOWN) == LOW);
-  if (bothHeld) {
-    if (setupHoldStart == 0) setupHoldStart = millis();
-    if (millis() - setupHoldStart > SETUP_HOLD_MS) {
-      Serial.println("[BTN] both held 5s -> setup mode");
-      flashLed(); delay(200); flashLed(); delay(200);
-      startSetupMode();
-      return;
-    }
-  } else {
-    setupHoldStart = 0;
   }
 }
