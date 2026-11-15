@@ -846,7 +846,7 @@ void testFeedbackNonBlockingPatternZeroStopsFlash() {
   EXPECT_EQ(fake::state().pinOutputs[LED_BUILTIN], 1);  // and stays off
 }
 
-void testInvalidCommandDisconnectsPeer() {
+void testUnknownRecordKeepsPeerAndResyncs() {
   resetAll();
   bootNormal();
   const FakeTcpConnectionPtr conn = connectObcPeer();
@@ -854,9 +854,17 @@ void testInvalidCommandDisconnectsPeer() {
   const unsigned char bad[] = {0x07};  // unknown message type
   peerSend(conn, bad, sizeof bad);
   loop();
-  EXPECT_TRUE(!conn->connected);
-  EXPECT_TRUE(!obcClient.connected());
-  EXPECT_CONTAINS("log", fake::state().serialOutput, "invalid command");
+  EXPECT_TRUE(conn->connected);  // unknown data must not kill the session
+  EXPECT_TRUE(obcClient.connected());
+  EXPECT_CONTAINS("log", fake::state().serialOutput, "unknown byte 0x07, resync");
+
+  // After the resync the parser accepts a well-formed record again.
+  const unsigned char haptic[] = {0x03, 0x01, 0x00, 0x00};
+  peerSend(conn, haptic, sizeof haptic);
+  loop();
+  loop();  // updateLed() runs on the next loop pass
+  EXPECT_TRUE(conn->connected);
+  EXPECT_EQ(fake::state().pinOutputs[LED_BUILTIN], 0);  // completed -> flash
 
   // The firmware keeps serving a fresh peer afterwards.
   const FakeTcpConnectionPtr next = connectObcPeer(9);
@@ -896,14 +904,19 @@ void testClientReplacementResetsParser() {
   const FakeTcpConnectionPtr b = connectObcPeer(8);  // replaces a
   EXPECT_TRUE(!a->connected);
 
-  // If the parser still held A's partial record, this byte would be swallowed
-  // as id payload (Incomplete, peer kept). With the reset it is an unknown
-  // message type: the firmware drops the peer.
-  const unsigned char probe[] = {0x05};
+  // If the parser still held A's partial record, the valid haptic below would
+  // be swallowed as id payload (Incomplete, no LED flash). With the reset it
+  // parses completely after skipping the unknown probe byte.
+  const unsigned char probe[] = {0x05};  // unknown type -> resync, peer kept
   peerSend(b, probe, sizeof probe);
   loop();
-  EXPECT_TRUE(!b->connected);
-  EXPECT_TRUE(!obcClient.connected());
+  EXPECT_TRUE(b->connected);  // unknown data must not kill the session
+  const unsigned char haptic[] = {0x03, 0x01, 0x00, 0x00};
+  peerSend(b, haptic, sizeof haptic);
+  loop();
+  loop();  // updateLed() runs on the next loop pass
+  EXPECT_TRUE(b->connected);
+  EXPECT_EQ(fake::state().pinOutputs[LED_BUILTIN], 0);  // parsed -> flash
 }
 
 }  // namespace
@@ -929,7 +942,7 @@ int main() {
   testButtonEventsDeliveredToPeer();
   testShortClickSurvivesTcpBacklog();
   testFeedbackNonBlockingPatternZeroStopsFlash();
-  testInvalidCommandDisconnectsPeer();
+  testUnknownRecordKeepsPeerAndResyncs();
   testPartialMessageHeldAcrossLoops();
   testClientReplacementResetsParser();
 
