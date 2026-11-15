@@ -27,7 +27,7 @@
 #include <EEPROM.h>
 #include "ObcProtocol.h"
 
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.2"
 #define OTA_USER "admin"
 
 // ---------- OpenBikeControl ----------
@@ -209,10 +209,12 @@ void handleObcClient() {
     if (byte < 0) break;
     obc::ParseResult result = obcParser.feed(static_cast<uint8_t>(byte));
     if (result == obc::ParseResult::Invalid) {
-      Serial.println("[OBC] invalid command, disconnecting client");
-      obcClient.stop();
+      // MyWhoosh sends an undocumented handshake record (type 0x0E and
+      // possibly others) right after connecting. Unknown data must not kill
+      // the session: resync the parser and keep the client connected.
+      Serial.printf("[OBC] unknown byte 0x%02X, resync\n", byte);
       obcParser.reset();
-      return;
+      continue;
     }
     if (result != obc::ParseResult::Complete) continue;
     const obc::Message& msg = obcParser.message();

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2
+
+- Keep the OpenBikeControl TCP session alive when the app sends records outside
+  the public spec (MyWhoosh transmits an undocumented 0x0E handshake right
+  after connecting). Resync the parser on unknown bytes instead of dropping
+  the client — previously the device disconnected itself seconds after every
+  connection attempt.
+
 ## 1.0.1
 
 - Require the `admin` username and the configured OTA password for web updates.
